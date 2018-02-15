@@ -1,0 +1,227 @@
+Index: compiler/ElabData/basics/lambdavar.sig
+===================================================================
+--- compiler/ElabData/basics/lambdavar.sig	(revision 4519)
++++ compiler/ElabData/basics/lambdavar.sig	(working copy)
+@@ -4,7 +4,7 @@
+ signature LAMBDA_VAR = 
+ sig
+ 
+-  type lvar  
++  type lvar = int
+ 
+   val saveLvarNames : bool ref
+   val lvarIsNamed : lvar -> bool
+Index: compiler/Elaborator/basics/elabcontrol.sig
+===================================================================
+--- compiler/Elaborator/basics/elabcontrol.sig	(revision 4519)
++++ compiler/Elaborator/basics/elabcontrol.sig	(working copy)
+@@ -50,4 +50,7 @@
+ 
+   val printAbsyn : bool ref
+ 
++  val unusedBindingWarn : bool ref
++      (* Elaborator/elaborate/check-unused.sml *)
++
+ end (* signature ELAB_CONTROL *)
+Index: compiler/Elaborator/basics/elabcontrol.sml
+===================================================================
+--- compiler/Elaborator/basics/elabcontrol.sml	(revision 4519)
++++ compiler/Elaborator/basics/elabcontrol.sml	(working copy)
+@@ -89,5 +89,8 @@
+ 
+     val printAbsyn = ref false
+ 
++   val unusedBindingWarn =
++	cnew ("unused-binding-warn", "warn when variables are defined but not used", true)
++
+   end (* local *)
+ end (* structure ElabControl *)
+Index: compiler/Elaborator/elaborate/check-unused.sml
+===================================================================
+--- compiler/Elaborator/elaborate/check-unused.sml	(nonexistent)
++++ compiler/Elaborator/elaborate/check-unused.sml	(working copy)
+@@ -0,0 +1,160 @@
++structure CheckUnused =
++struct
++structure VarSet = HashSetFn(
++    struct
++    open VarCon
++    type hash_key = var
++    fun hashVal (VALvar {path, access, ...}) =
++      let val sn = Symbol.number (SymPath.first path) handle SymPath => 0w0
++          open Access
++          fun word_of_word8 w8 = Word.fromLargeWord (Word8.toLargeWord w8)
++          val rec accessHash : Access.access -> word = fn
++                              LVAR lvar => Word.fromInt lvar
++            | EXTERN persstamp =>
++                Word8Vector.foldr (fn (i, acc : word) => acc * 0w31 + word_of_word8 i) 0w0 (PersStamps.toBytes persstamp)
++            | PATH (a, i)=> accessHash a + Word.fromInt i
++            | NO_ACCESS => 0w0
++      in accessHash access + sn end
++      | hashVal _ = 0w1494288992 (* random integer *)
++
++    fun sameKey (VALvar k1, VALvar k2) =
++      (SymPath.equal (#path k1, #path k2))
++      andalso Access.prAcc (#access k1) = Access.prAcc (#access k2)
++      | sameKey _ = false (* don't care *)
++
++    end)
++
++(* debugging *)
++val say = Control_Print.say
++val debugging = ElabControl.etopdebugging (* default false *)
++fun debugmsg (msg: string) =
++  if !debugging then (say msg; say "\n") else ()
++val debugPrint = (fn x => ElabDebug.debugPrint debugging x)
++
++fun bug msg = ErrorMsg.impossible("CheckUnused: " ^ msg)
++
++fun checkUnusedBindings
++        (ast : Absyn.dec, err : ErrorMsg.errorFn)
++    : unit =
++  let
++      val usedVars = VarSet.mkEmpty 32
++
++      fun sawVar (var : VarCon.var) =
++        VarSet.add (usedVars, var)
++
++      fun sawVarDecl region (var : VarCon.var) =
++        if VarSet.delete (usedVars, var)
++        then ()
++        else case var of
++                 VarCon.VALvar {path, ...} =>
++                 err region ErrorMsg.WARN
++                     ("unused " ^ Symbol.describe
++                                      (SymPath.first path)) ErrorMsg.nullErrorBody
++              | _ => () (* whatever *)
++
++      open Absyn
++      (* when we see a var add it to usedVars, when we go back up the tree and find its binder
++       we remove it from the table *)
++      fun checkExp (region : SourceMap.region) : Absyn.exp -> unit = fn
++            VARexp (var, _) => sawVar (!var)
++          | CONexp _ => ()
++          | RECORDexp fields => List.app (checkExp region o #2) fields
++          | SELECTexp (_, exp) => checkExp region exp
++          | VECTORexp (exps, _) => checkExps region exps
++          | PACKexp (exp, _, _) => checkExp region exp
++          | APPexp (function, argument) => checkExps region [function, argument]
++          | HANDLEexp (expr, (rules, _)) => (checkExp region expr; checkRules region rules)
++          | RAISEexp (exp, _) => checkExp region exp
++          | CASEexp (exp, rules, _) => (checkExp region exp; checkRules region rules)
++          | IFexp {test, thenCase, elseCase} => checkExps region [test, thenCase, elseCase]
++          | ( ANDALSOexp (e1, e2)
++            | ORELSEexp (e1, e2)) => checkExps region [e1, e2]
++          | WHILEexp {test, expr} => checkExps region [test, expr]
++          | FNexp (rules, _) => checkRules region rules
++          | LETexp (dec, expr) => (checkExp region expr; checkDec true region dec)
++          | SEQexp exps => checkExps region exps
++          | CONSTRAINTexp (expr, _) => checkExp region expr
++          | MARKexp (expr, region) => checkExp region expr
++          | ( INTexp _
++            | WORDexp _
++            | REALexp _
++            | STRINGexp _
++            | CHARexp _ ) => ()
++      and checkExps region exps = List.app (checkExp region) exps
++      and checkRules region rules = List.app (checkRule region) rules
++      and checkRule region (RULE (pat, exp)) =
++          (checkExp region exp;
++           checkPat region pat) (* Order is important, find the usages first *)
++      and checkPat region = fn
++              WILDpat => ()
++        | VARpat var => sawVarDecl region var
++        | ( INTpat _
++          | WORDpat _
++          | REALpat _
++          | STRINGpat _
++          | CHARpat _
++          | CONpat _
++          | NOpat) => ()
++        | RECORDpat {fields, ...} => List.app (fn (_, pat) => checkPat region pat) fields
++        | APPpat (_, _, pat) => checkPat region pat
++        | CONSTRAINTpat (pat, _) => checkPat region pat
++        | LAYEREDpat (p1, p2) => (checkPat region p1; checkPat region p2)
++        | ORpat (p1, p2) => (checkPat region p1; checkPat region p2)
++        | VECTORpat (pats, _) => List.app (checkPat region) pats
++        | MARKpat (pat, region) => checkPat region pat
++      and checkDec checkdeclp region = fn
++              VALdec [VB{exp, pat, ...}] =>
++              (checkExp region exp;
++               if checkdeclp
++               then checkPat region pat
++               else ())
++            | VALdec _ => bug "VALdec with nonsingleton list (see absyn.sml:70)"
++            | VALRECdec rvbs =>
++              (List.app (fn (RVB {exp, ...}) => checkExp region exp) rvbs;
++               if checkdeclp
++               then List.app (fn (RVB {var, ...}) => sawVarDecl region var) rvbs
++               else ())
++            | DOdec exp => checkExp region exp
++            | TYPEdec _ => ()
++            | DATATYPEdec _ => ()
++            | ABSTYPEdec {body, ...} => checkDec checkdeclp region body
++            | EXCEPTIONdec ebs => ()
++            | STRdec strbs => List.app (fn STRB {def, ...} => checkStrexp checkdeclp region def) (List.rev strbs)
++            | ABSdec strbs => List.app (fn STRB {def, ...} => checkStrexp checkdeclp region def) (List.rev strbs)
++            | FCTdec fctbs => List.app (fn FCTB {def, ...} => checkFctexp checkdeclp region def) (List.rev fctbs)
++            | SIGdec _ => ()
++            | FSIGdec _ => ()
++            | OPENdec _ => ()
++            | LOCALdec (d1, d2) => (checkDec checkdeclp region d2; checkDec true region d1)
++            | SEQdec decs => List.app (checkDec checkdeclp region) (List.rev decs)
++            | OVLDdec _ => ()
++            | FIXdec _ => ()
++            | MARKdec (dec, region) => checkDec checkdeclp region dec
++      and checkStrexp checkdeclp region = fn
++              MARKstr (str, region) => checkStrexp checkdeclp region str
++            (* Do it in the right order since we don't check for unused structures *)
++            | LETstr (dec, str) => (checkDec checkdeclp region dec;
++                                    checkStrexp checkdeclp region str)
++            | VARstr _ => ()
++            | APPstr _ => ()
++            | STRstr _ => () (* just names of things as far as I can tell *)
++      and checkFctexp checkdeclp region = fn
++              MARKfct (fct, region) => checkFctexp checkdeclp region fct
++            | LETfct (dec, fct) => (checkDec checkdeclp region dec;
++                                    checkFctexp checkdeclp region fct)
++            | VARfct _ => ()
++            | FCTfct {def, ...} => checkStrexp checkdeclp region def
++
++  (* In theory we would check declarations that can't escape, like decls in
++         local blocks and structures that ascribe to signatures.
++         In such a world we would also check type variables also though, and maybe even
++         look to see what can escape the CM system. *)
++
++  in
++      debugmsg ">>checkUnusedBindings";
++      (if !ElabControl.unusedBindingWarn
++       then checkDec false SourceMap.nullRegion ast
++       else debugmsg "ElabControl.unusedBindingWarn is false, not checking");
++      debugmsg "<<checkUnusedBindings"
++  end
++end
+Index: compiler/Elaborator/elaborate/elabtop.sml
+===================================================================
+--- compiler/Elaborator/elaborate/elabtop.sml	(revision 4519)
++++ compiler/Elaborator/elaborate/elabtop.sml	(working copy)
+@@ -205,6 +205,7 @@
+       in
+ 	debugmsg "<<elabTop";
+ 	ElabDebug.debugPrint ElabControl.printAbsyn ("ABSYN::", ppAbsynDec, dec);
++	CheckUnused.checkUnusedBindings (dec, error);
+ 	(dec, env)
+       end
+ 
+Index: compiler/Elaborator/elaborate.cm
+===================================================================
+--- compiler/Elaborator/elaborate.cm	(revision 4519)
++++ compiler/Elaborator/elaborate.cm	(working copy)
+@@ -75,6 +75,7 @@
+ 	elaborate/elabsig.sml
+ 	elaborate/elabdebug.sml
+ 	elaborate/elabmod.sml
++	elaborate/check-unused.sml
+ 	elaborate/elabtop.sml
+ 
+ 	print/ppprim.sml

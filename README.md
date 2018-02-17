@@ -21,5 +21,5 @@ bash -c "$(wget https://raw.githubusercontent.com/jvanburen/smlnj-warn-unused/11
 Move the created directory into the appropriate location on your computer (`/usr/local/smlnj/` on macOS at least). Either add the `bin` folder to your PATH variable, or add a symlink to it the `smlnj-110.82/bin/sml` executable in `/usr/local/bin`.
 
 ## Using the compiler
-By default, the compiler will warn when it detects an unused variable. This can be turned off by specifying `-Celab.unused-binding-warn=false` as a command line flag to sml. Additionally this can be controlled in the REPL by setting `Control.Elab.unusedBindingWarn := false` (or `true`)
+By default, the compiler will warn when it detects an unused binding. This can be turned off by specifying `-Celab.unused-binding-warn=false` as a command line flag to sml. Additionally this can be controlled in the REPL by setting `Control.Elab.unusedBindingWarn := false` (or `true`)
 

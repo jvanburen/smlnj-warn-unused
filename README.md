@@ -1,4 +1,4 @@
-# SML/NJ unused variable patch
+# SML/NJ Unused Binding Patch
 
 This downloads, modifies, and builds the SML/NJ compiler with a check for unused bindings.
 
